@@ -1,0 +1,165 @@
+---
+title: "Elemzes"
+author: "Balint Mazzag"
+date: '2021 10 25 '
+output: html_document
+---
+
+```{r setup, include=FALSE}
+library(tidyverse)
+library(WDI)
+
+WD <- getwd() %>% 
+  gsub(pattern = "kutatasmodszertan.*", replacement = "kutatasmodszertan")
+
+
+setwd(WD)
+```
+
+```{r data_load}
+
+pwt <- readxl::read_xlsx("data/pwt100.xlsx", sheet = "Data")
+
+tfr <- read_csv("data/DP_LIVE_25102021172144615.csv") %>% 
+  transmute(iso2c = countrycode::countrycode(LOCATION, origin = "iso3c", destination = "iso2c"), 
+            year = TIME, 
+            tfr = Value)
+
+family_benefit <- read_csv("data/DP_LIVE_25102021174058939.csv") %>% 
+  filter(SUBJECT == "TOT") %>% 
+  transmute(iso2c = countrycode::countrycode(LOCATION, origin = "iso3c", destination = "iso2c"), 
+            year = TIME, 
+            family_benefit = Value)
+
+gdp_per_capita <- WDI(indicator = "NY.GDP.PCAP.CD")
+gini <- WDI(indicator = "SI.POV.GINI")
+fem_education <- WDI(indicator = "SE.SEC.ENRR.FE")
+fem_unemployment <- WDI(indicator = "SL.UEM.TOTL.FE.NE.ZS")
+tot_unemployment <- WDI(indicator = "SL.UEM.TOTL.NE.ZS")
+fem_life_expect <- WDI(indicator = "SP.DYN.LE00.FE.IN")
+tot_life_expect <- WDI(indicator = "SP.DYN.LE00.IN")
+
+net_migration <- readxl::read_xlsx("data/WPP2019_MIGR_F01_NET_MIGRATION_RATE.xlsx") %>% 
+  filter(Type == "Country/Area") %>% 
+  select(country = 3, 8:ncol(.)) %>% 
+  pivot_longer(-1) %>% 
+  transmute(iso2c = countrycode::countrycode(country, origin = "country.name", destination = "iso2c"),
+            year = as.numeric(name),
+            net_migration = as.numeric(value))
+  
+  
+  
+
+
+full_data <- list(gdp_per_capita, tfr, family_benefit, fem_education, fem_life_expect, fem_unemployment, tot_life_expect, tot_unemployment, gini, net_migration) %>% 
+  reduce(left_join)
+
+oecd_countries <- family_benefit %>% select(iso2c) %>% unique() %>% pull()
+
+filtered_data <- full_data %>% 
+  filter(iso2c %in% oecd_countries & iso2c != "NZ")
+
+
+filtered_data %>% 
+  group_by(country) %>%  
+  summarize_all(funs(sum(!is.na(.)))) %>% 
+  ungroup()
+```
+
+
+```{r}
+safely_interpolate <- function(x) {
+  if (sum(!is.na(x)) > 2) {
+    approxfun(x)(seq_along(x))
+  } else {
+    x
+  }
+}
+
+df_safely_imputed <- filtered_data %>% 
+  relocate(iso2c, year) %>% 
+  arrange(year) %>% 
+  select(-country) %>% 
+  mutate_if(is.numeric, ~ ifelse(is.finite(.), ., NA)) %>%
+  group_by(iso2c) %>% 
+  group_modify(~ mutate_all(.x, safely_interpolate)) %>% 
+  group_modify(~ fill(.x, everything(), .direction = "down")) %>% 
+  ungroup()
+
+df_safely_imputed %>% 
+  pivot_longer(-(1:2)) %>% 
+  group_by(iso2c, name) %>% 
+  summarise(na = sum(is.na(value)), n = n(), ratio = na/n)
+
+variable_list <- names(df_safely_imputed %>% select(-(1:2)))
+
+```
+
+
+
+
+```{r}
+library(aTSA)
+
+df_ts <- df_safely_imputed %>% 
+  pivot_longer(-(1:2)) %>% 
+  filter(iso2c != "NZ" | name != "SI.POV.GINI") %>% 
+  filter(!is.na(value)) %>% 
+  arrange(name, year)
+
+variable_list <- df_ts %>% select(name) %>% unique() %>% pull()
+country_list <- df_ts %>% select(iso2c) %>% unique() %>% pull()
+
+
+df_all <-expand.grid(country_list, variable_list) %>% mutate_all(as.character) %>% filter(Var1 != "NZ" | Var2 != "SI.POV.GINI")
+```
+
+
+```{r}
+#Running ADF tests
+df_ts_filter <- 
+  df_ts %>% split(list(df_ts$name, df_ts$iso2c)) %>% 
+  {lapply(., function(x) ts(x$value, start = min(x$year), end = max(x$year)))}
+
+df_ts_tested <- bind_cols(df_all, lapply(df_ts_filter, function(x){x %>% PP.test()}) %>% 
+                            {lapply(., function(x){list(param = x[["parameter"]][["Truncation lag parameter"]], p_value = x$p.value) %>% data.frame()})} %>% 
+                            reduce(rbind))
+```
+
+
+```{r}
+#Granger-test
+df_granger <- filter(df_all, Var2 != "tfr")
+
+granger_causality <- map2_df(df_granger$Var2, df_granger$Var1,
+                             ~ tibble(country = .y, 
+                                      name = .x, 
+                                      pvalue = df_safely_imputed %>% 
+                                        filter(iso2c == .y) %>% 
+                                        select(year, .x, tfr) %>% 
+                                        na.omit() %>% 
+                                        transmute(x = ts(.[,.x], start = min(.$year), end = max(.$year)),
+                                                  y = ts(tfr, start = min(.$year), end = max(.$year))) %>% 
+                                        lmtest::grangertest(order = df_ts_tested %>% filter(Var1 == .y, Var2 == .x) %>% pull(param)) %>% 
+                                        .[2,4]))
+
+
+var_models <- map2(df_granger$Var1, df_granger$Var2,
+                   ~tibble(country = .x, 
+                                      name = .y, 
+                           coefficients = df_safely_imputed %>% 
+                              filter(iso2c == .x) %>% 
+                              select(year, .y, tfr) %>% 
+                              na.omit() %>%
+                              transmute(x = ts(.[,.y], start = min(.$year), end = max(.$year)),
+                                        y = ts(tfr, start = min(.$year), end = max(.$year))) %>% 
+                              vars::VAR(., p = df_ts_tested %>% filter(Var1 == .x, Var2 == .y) %>% pull(param), type = "const") %>% 
+                     {.[["varresult"]][["y"]][["coefficients"]]})) %>% 
+  {lapply(., function(z) cbind(z[,1:2], z %>% stack(coefficients)) %>% rownames_to_column("coefficients_name"))} %>% 
+  reduce(rbind)
+
+final_df <- left_join(var_models, granger_causality) %>% 
+  pivot_wider(names_from = coefficients_name, values_from = values) %>% 
+  select(country, name, pvalue, contains("x."))
+```
+
