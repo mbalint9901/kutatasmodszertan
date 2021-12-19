@@ -3,7 +3,31 @@ title: "Elemzes"
 author: "Balint Mazzag"
 date: '2021 10 25 '
 output: html_document
+editor_options: 
+  chunk_output_type: console
 ---
+
+```{r}
+NiceName <- function(x) {
+  case_when(
+    x == "tfr" ~ "Teljes termékenységi arányszám",
+    x == "family_benefit" ~ "Állami családi juttatások mértéke",
+    x == "net_migration" ~ "Nettó migráció (teljes lakosság arányában)",
+    x == "NY.GDP.PCAP.CD" ~ "Egy főre jutó GDP",
+    x == "SI.POV.GINI" ~ "Jövedelmi GINI index",
+    x == "SE.SEC.ENRR.FE" ~ "Középszintű oktatásban résztvevő nők aránya",
+    x == "SL.UEM.TOTL.FE.NE.ZS" ~ "Női munkanélküliségi ráta",
+    x == "SL.UEM.TOTL.NE.ZS" ~ "Teljes munkanélküliségi ráta",
+    x == "SP.DYN.LE00.FE.IN" ~ "Nők várható élettartama",
+    x == "SP.DYN.LE00.IN" ~ "Várható élettartam",
+    x == "adjTFR" ~ "Tempó-igazított termékenységi ráta",
+    TRUE ~ x
+  )
+}
+
+
+```
+
 
 ```{r setup, include=FALSE}
 library(tidyverse)
@@ -46,9 +70,7 @@ net_migration <- readxl::read_xlsx("data/WPP2019_MIGR_F01_NET_MIGRATION_RATE.xls
   transmute(iso2c = countrycode::countrycode(country, origin = "country.name", destination = "iso2c"),
             year = as.numeric(name),
             net_migration = as.numeric(value))
-  
-  
-  
+
 
 
 full_data <- list(gdp_per_capita, tfr, family_benefit, fem_education, fem_life_expect, fem_unemployment, tot_life_expect, tot_unemployment, gini, net_migration) %>% 
@@ -161,5 +183,110 @@ var_models <- map2(df_granger$Var1, df_granger$Var2,
 final_df <- left_join(var_models, granger_causality) %>% 
   pivot_wider(names_from = coefficients_name, values_from = values) %>% 
   select(country, name, pvalue, contains("x."))
+
+
+
+```
+
+```{r}
+
+adjTFR <- readxl::read_excel("data/adjTFR.xlsx", 
+                             sheet = "Tempo-adjusted TFR") %>% 
+  {set_names(.[-c(1, 2), ], .[2, ])} %>% 
+  pivot_longer(-1, names_to = "country", values_to = "adjTFR") %>% 
+  rename(time = PERIOD) %>% 
+  filter(adjTFR != 0 & !(country %in% c("DEUTE",	"DEUTW", "GBRTENW",	"GBR_NIR",	"GBR_SCO"))) %>% 
+  transmute(
+         iso2c = countrycode::countrycode(country, origin = "iso3c", destination = "iso2c"),
+         year = as.double(time),
+    adjTFR = as.numeric(adjTFR))
+
+tfr_comp <- left_join(tfr, adjTFR)
+
+tfr_comp %>% 
+  pivot_longer(-(1:2)) %>% 
+  filter(iso2c == "HU") %>% 
+  ggplot(aes(x = year, y = value, color = NiceName(name)))+
+  geom_line(size = 1.5) +
+  geom_hline(yintercept = 2.1, linetype = "dashed", size = 1) + 
+  scale_x_continuous(breaks = seq(1960, 2020, 5)) +
+  scale_colour_brewer(palette = "Set2") +
+  theme(legend.position = "bottom") +
+  labs(y = "Termékenységi ráta",
+       x = "Év",
+       title = "Magyarország termékenységi rátájának alakulása",
+       color = "Változó")
+```
+
+Legkorábbi adatpont elérhetősége
+
+```{r}
+
+df_safely_imputed %>% 
+  pivot_longer(-(1:2)) %>% 
+  filter(!is.na(value)) %>% 
+  group_by(iso2c, name) %>% 
+  slice_min(1) %>% 
+  ungroup() %>% 
+  select(-value) %>% 
+  mutate(name = NiceName(name),
+         iso2c = countrycode::countrycode(iso2c, origin = "iso2c", destination = "country.name")) %>% 
+  pivot_wider(names_from = "name", values_from = "year") %>% 
+  clipr::write_clip()
+
+```
+
+
+Francia adatok bemutatása
+
+```{r}
+
+df_safely_imputed %>% 
+  filter(iso2c == "HU") %>% 
+  pivot_longer(-(1:2)) %>% 
+  ggplot(aes(x=year, y = value, color = NiceName(name))) +
+  geom_line(size = 1.5) +
+  scale_color_brewer(palette = "Set2") +
+ facet_wrap(~NiceName(name), scales = "free")
+
+df_safely_imputed %>% 
+  select(iso2c, year, family_benefit) %>% 
+  filter(iso2c %in% c("HU", "DE", "UK", "US", "FR", "SE", "CZ", "PL", "PT") & !is.na(family_benefit) & year <2018) %>% 
+  ggplot(aes(x = year, y = family_benefit, group = iso2c, color = countrycode::countrycode(iso2c, origin = "iso2c", destination = "country.name"))) +
+  geom_line(size = 1.5) +
+  scale_colour_brewer(palette = "Set2") +
+  labs(color = "Ország",
+       x = "Év",
+       y = "Állami családi juttatások mértéke")
+  
+
+df_safely_imputed %>% 
+  filter(year == 2019 & net_migration > -5 & net_migration <5 ) %>% 
+  ggplot(aes(x = `SL.UEM.TOTL.FE.NE.ZS`, y = `SI.POV.GINI`)) +
+  geom_point() +
+  ggrepel::geom_label_repel(aes(label = countrycode::countrycode(iso2c, origin = "iso2c", destination = "country.name"), fill = net_migration)) +
+  scale_fill_gradient2(low = RColorBrewer::brewer.pal(3, "Set2")[2], high = RColorBrewer::brewer.pal(3, "Set2")[1]) +
+  labs(x = "Női munkanélküliségi ráta",
+       y = "Jövedelmi GINI index",
+       fill = NiceName("net_migration"),
+       title = "Országok 2019-as adatainak bemutatása") +
+  theme(legend.position = "bottom")
+```
+
+Külön átlagok a három különböző csoportra
+
+```{r}
+df_safely_imputed %>%
+  filter(year == 2020) %>% 
+  pivot_longer(-(1:2)) %>% 
+  mutate(name = NiceName(name)) %>% 
+  pivot_wider(names_from = name, values_from = value) %>% 
+  mutate(tfr_level = cut_number(`Teljes termékenységi arányszám`, 4, labels = c("low", "mid_low", "mid_high", "high"))) %>% 
+  select(-iso2c) %>% 
+  group_by(tfr_level) %>% 
+  summarise(across(everything(), list(mean))) %>% 
+  ungroup()
+  #clipr::write_clip()
+
 ```
 
